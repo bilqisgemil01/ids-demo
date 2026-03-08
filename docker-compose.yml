@@ -9,4 +9,14 @@ services:
       - ./mosquitto/log:/mosquitto/log
       - ./mosquitto/data:/mosquitto/data
     restart: unless-stopped
-
+  publisher:
+    image: efrecon/mqtt-client
+    container_name: publisher
+    depends_on:
+      mosquitto:
+        condition: service_started
+    command: >
+      sh -c 'while true; do
+        mosquitto_pub -h mosquitto -t "test/topic" -m "Hello from publisher" -i publisher1;
+        sleep 1;
+      done'
