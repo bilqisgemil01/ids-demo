@@ -29,3 +29,18 @@ services:
         condition: service_started
     command: >
       sh -c 'mosquitto_sub -h mosquitto -t "test/#" -v'
+
+  attacker:
+    image: efrecon/mqtt-client
+    container_name: attacker
+    depends_on: 
+      mosquitto:
+        condition: service_started
+    command: > 
+      sh -c 'sleep 3;
+      echo "Attacker ready. Run: docker exec -it attacker sh";
+      tail -f /dev/null'
+    # Attack 1: burst flood
+    # docker exec -it attacker sh -c 'for i in $(seq 1 300); do mosquitto_pub -h mosquitto -t "attack/flood" -m "x$i" -i attacker1; done'
+    # Attack 2: publish to restricted topic
+    # docker exec -it attacker sh -c 'mosquitto_pub -h mosquitto -t "admin/commands" -m "reboot" -i attacker1'
