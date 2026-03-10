@@ -41,6 +41,6 @@ services:
       echo "Attacker ready. Run: docker exec -it attacker sh";
       tail -f /dev/null'
     # Attack 1: burst flood
-    # docker exec -it attacker sh -c 'for i in $(seq 1 300); do mosquitto_pub -h mosquitto -t "attack/flood" -m "x$i" -i attacker1; done'
+    # docker exec -it attacker sh -c "for i in $(seq 1 50); do mosquitto_pub -h mosquitto -t "attack/flood" -m "x$i" -i attacker1; done"
     # Attack 2: publish to restricted topic
-    # docker exec -it attacker sh -c 'mosquitto_pub -h mosquitto -t "admin/commands" -m "reboot" -i attacker1'
+    # docker exec -it attacker sh -c "mosquitto_pub -h mosquitto -t "admin/commands" -m "reboot" -i attacker1"
