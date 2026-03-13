@@ -18,9 +18,9 @@ services:
         condition: service_started
     command: >
       sh -c 'while true; do
-        mosquitto_pub -h mosquitto -t "test/topic" -m "Hello from publisher" -i publisher1;
+        echo "Hello from publisher $(date -Iseconds)";
         sleep 1;
-      done'
+      done | mosquitto_pub -h mosquitto -t "test/topic" -l -i publisher1'
   subscriber:
     image: efrecon/mqtt-client
     container_name: subscriber
