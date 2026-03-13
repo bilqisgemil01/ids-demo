@@ -44,3 +44,21 @@ services:
     # docker exec -it attacker sh -c 'for i in $(seq 1 300); do mosquitto_pub -h mosquitto -t "attack/flood" -m "x$i" -i attacker1; done'
     # Attack 2: publish to restricted topic
     # docker exec -it attacker sh -c 'mosquitto_pub -h mosquitto -t "admin/commands" -m "reboot" -i attacker1'
+
+  ids: 
+    build: ./services/ids 
+    container_name: ids 
+    depends_on: 
+      mosquitto: 
+        condition: service_started 
+    environment: 
+      LOG_PATH: /evidence/mosquitto.log 
+      ALERT_DIR: /alerts 
+      WINDOW_SEC: "20" 
+      FLOOD_THRESHOLD: "20"
+      RESTRICT_PREFIX: "admin/" 
+      COOLDOWN_SEC: "10"
+    volumes: 
+      - ./mosquitto/log:/evidence:ro 
+      - ./alerts:/alerts
+    restart: unless-stopped
