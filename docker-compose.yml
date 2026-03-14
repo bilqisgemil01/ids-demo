@@ -19,7 +19,7 @@ services:
     command: >
       sh -c 'while true; do
         echo "Hello from publisher $(date -Iseconds)";
-        sleep 1;
+        sleep 10;
       done | mosquitto_pub -h mosquitto -t "test/topic" -l -i publisher1'
   subscriber:
     image: efrecon/mqtt-client
@@ -28,7 +28,7 @@ services:
       mosquitto: 
         condition: service_started
     command: >
-      sh -c 'mosquitto_sub -h mosquitto -t "test/#" -v'
+      sh -c 'mosquitto_sub -h mosquitto -t "test/#" -v -i subscriber1'
 
   attacker:
     image: efrecon/mqtt-client
@@ -41,9 +41,21 @@ services:
       echo "Attacker ready. Run: docker exec -it attacker sh";
       tail -f /dev/null'
     # Attack A: Connection churn
+    # -> Small burst:
+    # docker exec -it attacker sh -c "i=1; while [ $i -le 10 ]; do mosquitto_pub -h mosquitto -t attack/churn -m x$i -i attacker1; i=$((i+1)); done"
+    # -> Big burst: 
     # docker exec -it attacker sh -c "i=1; while [ $i -le 50 ]; do mosquitto_pub -h mosquitto -t attack/churn -m x$i -i attacker1; i=$((i+1)); done"
     # Attack B: Message-rate flood
     # docker exec -it attacker sh -c "i=1; while [ $i -le 200 ]; do echo x$i; i=$((i+1)); done | mosquitto_pub -h mosquitto -t attack/msgflood -l -i attacker_persist"
+
+  attack_observer:
+    image: efrecon/mqtt-client
+    container_name: attack_observer
+    depends_on:
+      mosquitto:
+        condition: service_started
+    command: >
+      sh -c 'mosquitto_sub -h mosquitto -t "attack/#" -v -i attack_observer1'
 
   ids: 
     build: ./services/ids 
@@ -52,11 +64,24 @@ services:
       mosquitto: 
         condition: service_started 
     environment: 
-      LOG_PATH: /evidence/mosquitto.log 
-      ALERT_DIR: /alerts 
-      WINDOW_SEC: "20" 
-      FLOOD_THRESHOLD: "20"
-      RESTRICT_PREFIX: "admin/" 
+      # Input A: broker log (connection churn)
+      LOG_PATH: /evidence/mosquitto.log
+      # Input B: MQTT subscription (message-rate flood)
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: "attack/msgflood"
+
+      ALERT_DIR: /alerts
+
+      # Churn rule parameters
+      CHURN_WINDOW_SEC: "5"
+      CHURN_THRESHOLD: "20"
+      SHORT_SESSION_SEC: "2"
+
+      # Message-flood rule parameters
+      MSG_WINDOW_SEC: "5"
+      MSG_THRESHOLD: "100"
+
       COOLDOWN_SEC: "10"
     volumes: 
       - ./mosquitto/log:/evidence:ro 
