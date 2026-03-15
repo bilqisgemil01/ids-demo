@@ -75,7 +75,7 @@ services:
 
       # Churn rule parameters
       CHURN_WINDOW_SEC: "5"
-      CHURN_THRESHOLD: "20"
+      CHURN_THRESHOLD: "10"
       SHORT_SESSION_SEC: "2"
 
       # Message-flood rule parameters
