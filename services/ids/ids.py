@@ -1,14 +1,19 @@
-import os, time, re
+import os, time, re, threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 
-# Step 2: 
+import paho.mqtt.client as mqtt
+
+# Step 3: 
 # - Tail-follow the Mosquitto log file
 # - Parse CONNECT / DISCONNECT lines
 # + 
 # - Detect connection churn as "many short sessions" in a sliding window
 # - Alert grouped by both source IP and client_id
+# + 
+# - Add MQTT subscription channel (paho-mqtt) to observe message-rate floods directly
+# - For now, just prove we receive messages by printing a counter
 
 # log timestamp format: 
 # YYYY-MM-DDTHH:MM:SS+0000: <message...>
@@ -88,6 +93,92 @@ def tail_file(path: str):
                 continue
             yield line.rstrip("\n")
 
+class MsgCounter:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.total = 0
+        self.last_print_total = 0
+        self.last_print_time = time.time()
+
+    def inc_and_get(self, n: int = 1) -> int:
+        with self.lock:
+            self.total += n
+            return self.total
+
+    def maybe_print(self, every_n: int = 25, min_interval_sec: float = 1.0):
+        now = time.time()
+        with self.lock:
+            delta = self.total - self.last_print_total
+            if delta >= every_n:
+                if delta > 0:
+                    print(f"[mqtt] received +{delta} messages (total={self.total})")
+                    self.last_print_total = self.total
+                    self.last_print_time = now 
+
+def start_mqtt_listener(counter: MsgCounter):
+    host = os.getenv("MQTT_HOST", "mosquitto")
+    port = int(os.getenv("MQTT_PORT", "1883"))
+    topic = os.getenv("MQTT_TOPIC", "attack/msgflood")
+    client_id = os.getenv("MQTT_CLIENT_ID", "ids1")
+
+    msg_window_sec = int(os.getenv("MSG_WINDOW_SEC", "5"))
+    msg_threshold = int(os.getenv("MSG_THRESHOLD", "100"))
+    cooldown_sec = int(os.getenv("COOLDOWN_SEC", "10"))
+
+    msg_times = deque()     # timestamps of received messages
+    last_msg_alert = 0.0    # for cooldown
+
+    # Callback API v2 signatures (paho-mqtt 2.x)
+    def on_connect(client, userdata, flags, reason_code, properties):
+        # reason_code == 0 means success 
+        print(f"[mqtt] connected reason_code={reason_code} host={host}:{port} client_id={client_id}")
+        result, mid = client.subscribe(topic, qos=0)
+        print(f"[mqtt] subscribe requested topic={topic} result={result} mid={mid}")
+
+    def on_subscribe(client, userdata, mid, reason_codes, properties):
+        print(f"[mqtt] subscribed mid={mid} reason_codes={list(reason_codes)}")
+
+    def on_message(client, userdata, msg):
+        new_total = counter.inc_and_get(1)
+
+        if new_total <= 5:
+            print(f"[mqtt] msg#{new_total} topic={msg.topic} payload_preview={msg.payload[:50]!r}")
+
+        nonlocal last_msg_alert
+
+        now = time.time()
+        msg_times.append(now)
+
+        cutoff = now - msg_window_sec
+        while msg_times and msg_times[0] < cutoff:
+            msg_times.popleft()
+
+        if len(msg_times) >= msg_threshold and (now - last_msg_alert) >= cooldown_sec:
+            last_msg_alert = now
+            print(
+                f"ALERT_MSG_FLOOD topic={msg.topic} "
+                f"msgs_in_{msg_window_sec}s={len(msg_times)} threshold={msg_threshold}"
+            )
+        
+        counter.maybe_print(every_n=25, min_interval_sec=1.0)
+
+    def on_disconnect(client, userdata, reason_code, properties):
+        print(f"[mqtt] disconnected reason_code={reason_code}")
+
+    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_subscribe = on_subscribe
+    mqtt_client.on_message = on_message
+    mqtt_client.on_disconnect = on_disconnect
+
+    while True:
+        try:
+            mqtt_client.connect(host, port, keepalive=60)
+            mqtt_client.loop_forever()
+        except Exception as e:
+            print(f"[mqtt] error: {e} (retrying in 2s)")
+            time.sleep(2)
+
 def main():
     log_path = os.getenv("LOG_PATH", "/evidence/mosquitto.log")
 
@@ -97,13 +188,17 @@ def main():
     short_session_sec = float(os.getenv("SHORT_SESSION_SEC", "2"))
     cooldown_sec = int(os.getenv("COOLDOWN_SEC", "10"))
 
-    print(f"[ids] Step 2: churn detection (log tail) from {log_path}")
+    print(f"[ids] Step 3.1: churn detection + MQTT subscription")
+    print(f"[ids] log={log_path}")
     print(f"[ids] churn_window_sec={churn_window_sec} churn_threshold={churn_threshold} short_session_sec={short_session_sec}")
+
+    # Start MQTT listener in background
+    msg_counter = MsgCounter()
+    t = threading.Thread(target=start_mqtt_listener, args=(msg_counter,),daemon=True)
+    t.start()
     
-    # Session starts keyed by unique socker identity (client_id, ip, port)
     session_start: dict[tuple[str, str, int], float] = {}
 
-    # Sliding window: short session timestamps grouped by IP and client
     short_by_ip: dict[str, deque[float]] = defaultdict(deque)
     short_by_client: dict[str, deque[float]] = defaultdict(deque)
 
@@ -114,9 +209,6 @@ def main():
         if ev is None:
             continue
 
-        # Structured output (easy to validate)
-        # Example:
-        # CONNECT ts=2026-03-14T12:06:40+00:00 ip=172.18.0.7 port=53328 client=attacker1
         print(
             f"{ev.typ} ts={ev.ts.astimezone(timezone.utc).isoformat()} "
             f"ip={ev.ip} port={ev.port} client={ev.client_id}"
@@ -133,16 +225,13 @@ def main():
         # DISCONNECT
         start_sec = session_start.pop(key, None)
         if start_sec is None:
-            # Didn't observe the CONNECT (maybe IDS started mid-stream) => ignore
             continue
 
         duration = ts_sec - start_sec
 
-        # Only count short-lived sessions as churn evidence
         if duration > short_session_sec:
             continue
 
-        # Record event in both groupings
         dq_ip = short_by_ip[ev.ip]
         dq_client = short_by_client[ev.client_id]
         dq_ip.append(ts_sec)

@@ -70,6 +70,7 @@ services:
       MQTT_HOST: mosquitto
       MQTT_PORT: "1883"
       MQTT_TOPIC: "attack/msgflood"
+      MQTT_CLIENT_ID: "ids1"
 
       ALERT_DIR: /alerts
 
