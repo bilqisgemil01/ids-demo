@@ -1,11 +1,11 @@
-import os, time, re, threading
+import os, time, re, threading, json, uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 
 import paho.mqtt.client as mqtt
 
-# Step 3: 
+# Step 4: 
 # - Tail-follow the Mosquitto log file
 # - Parse CONNECT / DISCONNECT lines
 # + 
@@ -13,7 +13,9 @@ import paho.mqtt.client as mqtt
 # - Alert grouped by both source IP and client_id
 # + 
 # - Add MQTT subscription channel (paho-mqtt) to observe message-rate floods directly
-# - For now, just prove we receive messages by printing a counter
+# - Detect message flood + alert
+# + 
+# - Emit JSON alert files to ALERT_DIR (atomic write)
 
 # log timestamp format: 
 # YYYY-MM-DDTHH:MM:SS+0000: <message...>
@@ -35,6 +37,45 @@ class Event:
     ip: str
     port: int
     raw: str
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def canonical_ts_for_filename() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+def safe_token(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+
+def emit_alert(alert_dir: str, payload: dict) -> str:
+    """
+    Write alert as JSON with atomic replace:
+    - write temp file
+    - os.replace to final name
+    Returns the final path.
+    """
+    os.makedirs(alert_dir, exist_ok=True)
+
+    # Add common fields if not present
+    payload = dict(payload)
+    payload.setdefault("schema_version", "1.0")
+    payload.setdefault("id", str(uuid.uuid4()))
+    payload.setdefault("ts", utc_now_iso())
+
+    rule_id = payload.get("rule_id", "UNKNOWN")
+    group = payload.get("group", "NA")
+    ts = canonical_ts_for_filename()
+    rid = payload["id"].split("-")[0]   # short unique token
+
+    filename = f"alert-{ts}-{safe_token(rule_id)}-{safe_token(str(group))}-{rid}.json"
+    final_path = os.path.join(alert_dir, filename)
+    tmp_path = final_path + ".tmp"
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    os.replace(tmp_path, final_path)
+    return final_path
 
 def parse_timestamp(prefix: str) -> datetime:
     return datetime.strptime(prefix, TS_FORMAT)
@@ -115,7 +156,7 @@ class MsgCounter:
                     self.last_print_total = self.total
                     self.last_print_time = now 
 
-def start_mqtt_listener(counter: MsgCounter):
+def start_mqtt_listener(counter: MsgCounter, alert_dir: str):
     host = os.getenv("MQTT_HOST", "mosquitto")
     port = int(os.getenv("MQTT_PORT", "1883"))
     topic = os.getenv("MQTT_TOPIC", "attack/msgflood")
@@ -126,6 +167,7 @@ def start_mqtt_listener(counter: MsgCounter):
     cooldown_sec = int(os.getenv("COOLDOWN_SEC", "10"))
 
     msg_times = deque()     # timestamps of received messages
+    recent_payloads = deque(maxlen=5)
     last_msg_alert = 0.0    # for cooldown
 
     # Callback API v2 signatures (paho-mqtt 2.x)
@@ -141,6 +183,8 @@ def start_mqtt_listener(counter: MsgCounter):
     def on_message(client, userdata, msg):
         new_total = counter.inc_and_get(1)
 
+        recent_payloads.append(msg.payload[:50])
+
         if new_total <= 5:
             print(f"[mqtt] msg#{new_total} topic={msg.topic} payload_preview={msg.payload[:50]!r}")
 
@@ -148,7 +192,6 @@ def start_mqtt_listener(counter: MsgCounter):
 
         now = time.time()
         msg_times.append(now)
-
         cutoff = now - msg_window_sec
         while msg_times and msg_times[0] < cutoff:
             msg_times.popleft()
@@ -159,6 +202,23 @@ def start_mqtt_listener(counter: MsgCounter):
                 f"ALERT_MSG_FLOOD topic={msg.topic} "
                 f"msgs_in_{msg_window_sec}s={len(msg_times)} threshold={msg_threshold}"
             )
+
+            payload = {
+                "rule_id": "MSG_FLOOD",
+                "severity": "HIGH",
+                "source": "mqtt",
+                "group": msg.topic,
+                "stats": {
+                    "window_sec": msg_window_sec,
+                    "count_in_window": len(msg_times),
+                    "threshold": msg_threshold,
+                },
+                "evidence": {
+                    "recent_payload_previews": [p.decode("utf-8", errors="replace") for p in list(recent_payloads)],
+                },
+            }
+            path = emit_alert(alert_dir, payload)
+            print(f"[ids] wrote alert: {path}")
         
         counter.maybe_print(every_n=25, min_interval_sec=1.0)
 
@@ -181,6 +241,7 @@ def start_mqtt_listener(counter: MsgCounter):
 
 def main():
     log_path = os.getenv("LOG_PATH", "/evidence/mosquitto.log")
+    alert_dir = os.getenv("ALERT_DIR", "/alerts")
 
     # Churn rule params
     churn_window_sec = int(os.getenv("CHURN_WINDOW_SEC", "5"))
@@ -188,26 +249,31 @@ def main():
     short_session_sec = float(os.getenv("SHORT_SESSION_SEC", "2"))
     cooldown_sec = int(os.getenv("COOLDOWN_SEC", "10"))
 
-    print(f"[ids] Step 3.1: churn detection + MQTT subscription")
+    print(f"[ids] Step 4: JSON alerts (unsigned)")
     print(f"[ids] log={log_path}")
+    print(f"[ids] alert_dir={alert_dir}")
     print(f"[ids] churn_window_sec={churn_window_sec} churn_threshold={churn_threshold} short_session_sec={short_session_sec}")
 
     # Start MQTT listener in background
     msg_counter = MsgCounter()
-    t = threading.Thread(target=start_mqtt_listener, args=(msg_counter,),daemon=True)
+    t = threading.Thread(target=start_mqtt_listener, args=(msg_counter,alert_dir),daemon=True)
     t.start()
     
     session_start: dict[tuple[str, str, int], float] = {}
-
     short_by_ip: dict[str, deque[float]] = defaultdict(deque)
     short_by_client: dict[str, deque[float]] = defaultdict(deque)
-
     last_alert: dict[tuple[str, str], float] = {}
+
+    recent_lines_by_ip: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=6))
+    recent_lines_by_client: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=6))
 
     for line in tail_file(log_path):
         ev = parse_line(line)
         if ev is None:
             continue
+
+        recent_lines_by_ip[ev.ip].append(ev.raw)
+        recent_lines_by_client[ev.client_id].append(ev.raw)
 
         print(
             f"{ev.typ} ts={ev.ts.astimezone(timezone.utc).isoformat()} "
@@ -215,7 +281,6 @@ def main():
         )
 
         ts_sec = ev.ts.timestamp()
-
         key = (ev.client_id, ev.ip, ev.port)
 
         if ev.typ == "CONNECT":
@@ -253,6 +318,25 @@ def main():
                 f"threshold={churn_threshold} last_duration={duration:.3f}s"
             )
 
+            payload = {
+                "rule_id": "CHURN_IP",
+                "severity": "HIGH",
+                "source": "mosquitto_log",
+                "group": ev.ip,
+                "stats": {
+                    "window_sec": churn_window_sec,
+                    "count_in_window": len(dq_ip),
+                    "threshold": churn_threshold,
+                    "short_session_sec": short_session_sec,
+                    "last_duration_sec": round(duration, 6),
+                },
+                "evidence": {
+                    "recent_log_lines": list(recent_lines_by_ip[ev.ip]),
+                },
+            }
+            path = emit_alert(alert_dir, payload)
+            print(f"[ids] wrote alert: {path}")
+
         client_alert_key = ("CHURN_CLIENT", ev.client_id)
         if len(dq_client) >= churn_threshold and (ts_sec - last_alert.get(client_alert_key, 0) >= cooldown_sec):
             last_alert[client_alert_key] = ts_sec
@@ -260,6 +344,25 @@ def main():
                 f"ALERT_CHURN_CLIENT client={ev.client_id} short_sessions_in_{churn_window_sec}s={len(dq_client)} "
                 f"threshold={churn_threshold} last_duration={duration:.3f}s"
             )
+
+            payload = {
+                "rule_id": "CHURN_CLIENT",
+                "severity": "MEDIUM",
+                "source": "mosquitto_log",
+                "group": ev.client_id,
+                "stats": {
+                    "window_sec": churn_window_sec,
+                    "count_in_window": len(dq_client),
+                    "threshold": churn_threshold,
+                    "short_session_sec": short_session_sec,
+                    "last_duration_sec": round(duration, 6),
+                },
+                "evidence": {
+                    "recent_log_lines": list(recent_lines_by_client[ev.client_id]),
+                },
+            }
+            path = emit_alert(alert_dir, payload)
+            print(f"[ids] wrote alert: {path}")
 
 if __name__ == "__main__":
     main()
